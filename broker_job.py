@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -115,6 +116,36 @@ def stage_source(source_url: str, filename: str, directory: str) -> tuple[str, i
     return destination, size
 
 
+def upload_with_curl(staged_path: str, filename: str, size: int, api_key: str) -> requests.Response:
+    # curl handles an early HTTP rejection while a large TLS body is being sent.
+    # Pass credentials through stdin rather than command arguments or logs.
+    config = "\n".join([
+        "user = " + json.dumps(":" + api_key),
+        "url = " + json.dumps("https://pixeldrain.com/api/file/" + quote(safe_filename(filename))),
+        'header = "Content-Type: application/octet-stream"',
+        'header = "Accept: application/json"',
+    ]) + "\n"
+    try:
+        result = subprocess.run(
+            ["curl", "--silent", "--show-error", "--http1.1", "--connect-timeout", "30",
+             "--max-time", str(4 * 60 * 60), "--upload-file", staged_path,
+             "--write-out", "\n%{http_code}", "--config", "-"],
+            input=config, capture_output=True, text=True, timeout=4 * 60 * 60 + 30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("pixeldrain_curl_unavailable:" + type(exc).__name__) from exc
+    if result.returncode:
+        raise RuntimeError("pixeldrain_curl_failed:" + str(result.returncode))
+    body, separator, status = result.stdout.rpartition("\n")
+    if not separator or not status.isdigit() or not 100 <= int(status) <= 599:
+        raise RuntimeError("pixeldrain_curl_invalid_response")
+    response = requests.Response()
+    response.status_code = int(status)
+    response._content = body.encode("utf-8")
+    response.headers["Content-Type"] = "application/json"
+    return response
+
+
 def upload_staged_file(staged_path: str, filename: str, size: int, api_key: str) -> tuple[str, int]:
     mask(api_key)
     try:
@@ -131,6 +162,9 @@ def upload_staged_file(staged_path: str, filename: str, size: int, api_key: str)
                 },
                 timeout=(30, 4 * 60 * 60),
             )
+    except requests.exceptions.SSLError:
+        print("Retrying interrupted TLS upload with curl.", flush=True)
+        response = upload_with_curl(staged_path, filename, size, api_key)
     except requests.RequestException as exc:
         codes = [type(exc).__name__]
         pending = [exc]
