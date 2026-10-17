@@ -115,7 +115,7 @@ def stage_source(source_url: str, filename: str, directory: str) -> tuple[str, i
     return destination, size
 
 
-def upload_staged_file(staged_path: str, filename: str, size: int, api_key: str) -> str:
+def upload_staged_file(staged_path: str, filename: str, size: int, api_key: str) -> tuple[str, int]:
     mask(api_key)
     try:
         with open(staged_path, "rb") as staged:
@@ -132,10 +132,27 @@ def upload_staged_file(staged_path: str, filename: str, size: int, api_key: str)
                 timeout=(30, 4 * 60 * 60),
             )
     except requests.RequestException as exc:
-        raise RuntimeError("pixeldrain_upload_failed") from exc
+        codes = [type(exc).__name__]
+        pending = [exc]
+        seen = set()
+        while pending and len(seen) < 12:
+            error = pending.pop()
+            if id(error) in seen:
+                continue
+            seen.add(id(error))
+            name = type(error).__name__
+            if name not in codes:
+                codes.append(name)
+            number = getattr(error, "errno", None)
+            if isinstance(number, int):
+                codes.append(f"errno{number}")
+            pending.extend(value for value in (getattr(error, "__cause__", None), getattr(error, "__context__", None), *getattr(error, "args", ())) if isinstance(value, BaseException))
+        raise RuntimeError("pixeldrain_upload_failed:" + ":".join(codes[:8])) from exc
     payload = response.json() if response.headers.get("Content-Type", "").startswith("application/json") else {}
     if not response.ok or payload.get("success") is False:
-        raise RuntimeError("PixelDrain rejected the upload.")
+        provider_code = str(payload.get("value") or "rejected")
+        provider_code = re.sub(r"[^A-Za-z0-9_-]", "", provider_code)[:80]
+        raise RuntimeError(f"pixeldrain_http_{response.status_code}:{provider_code}")
     # PixelDrain can append quota metadata after a comma. The public URL uses
     # only the leading file ID.
     file_id = str(payload.get("id") or "").split(",", 1)[0].strip()
@@ -159,7 +176,7 @@ def run_job(job: dict[str, object]) -> dict[str, object]:
             staged_path, size = stage_source(source_url, filename, directory)
             for key in keys:
                 try:
-                    url = upload_staged_file(staged_path, filename, size, key)
+                    url, uploaded_size = upload_staged_file(staged_path, filename, size, key)
                     mask(url)
                     return {
                         "ok": True,
@@ -169,6 +186,7 @@ def run_job(job: dict[str, object]) -> dict[str, object]:
                     }
                 except Exception as exc:  # Do not reveal provider responses in public logs.
                     last_error = str(exc)[:120] or f"{type(exc).__name__}."
+                    print("Upload attempt failed: " + last_error, flush=True)
     except Exception as exc:  # Do not reveal broker-provided details in public logs.
         last_error = str(exc)[:120] or f"{type(exc).__name__}."
     return {"ok": False, "error": last_error}
